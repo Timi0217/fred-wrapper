@@ -50,6 +50,22 @@ INDICATOR_MAPPING = {
 }
 
 
+@app.get("/")
+async def root():
+    """API overview"""
+    return {
+        "name": "FRED API Wrapper",
+        "description": "Federal Reserve Economic Data — inflation, GDP, unemployment, interest rates, and 20+ economic indicators",
+        "endpoints": [
+            {"path": "/indicator?name=inflation", "description": "Get economic indicator by name"},
+            {"path": "/series?series_id=GDP", "description": "Get any FRED series by ID"},
+            {"path": "/search?query=employment", "description": "Search FRED series"},
+            {"path": "/health", "description": "Health check"}
+        ],
+        "available_indicators": sorted(INDICATOR_MAPPING.keys())
+    }
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
