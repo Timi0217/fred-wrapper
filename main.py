@@ -8,11 +8,16 @@ from fastapi.responses import JSONResponse
 app = FastAPI(title="FRED API Wrapper", version="1.0.0")
 
 # Check for API key at startup
-FRED_API_KEY = os.environ.get("FRED_API_KEY")
-if not FRED_API_KEY:
-    raise RuntimeError("FRED_API_KEY environment variable is required")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 
 FRED_BASE_URL = "https://api.stlouisfed.org/fred"
+
+
+def get_fred_key() -> str:
+    key = FRED_API_KEY or os.environ.get("FRED_API_KEY", "")
+    if not key:
+        raise HTTPException(status_code=503, detail="FRED_API_KEY not configured")
+    return key
 
 # Indicator name to FRED series ID mapping
 INDICATOR_MAPPING = {
@@ -64,7 +69,7 @@ async def get_series(series_id: str = Query(..., description="FRED series ID (e.
             # Get series metadata
             metadata_params = {
                 "series_id": series_id,
-                "api_key": FRED_API_KEY,
+                "api_key": get_fred_key(),
                 "file_type": "json"
             }
             metadata_response = await client.get(
@@ -88,7 +93,7 @@ async def get_series(series_id: str = Query(..., description="FRED series ID (e.
             # Get series observations
             obs_params = {
                 "series_id": series_id,
-                "api_key": FRED_API_KEY,
+                "api_key": get_fred_key(),
                 "file_type": "json",
                 "sort_order": "desc",
                 "limit": 10
@@ -168,7 +173,7 @@ async def get_indicator(name: str = Query(..., description="Indicator name (e.g.
             # Get series metadata
             metadata_params = {
                 "series_id": series_id,
-                "api_key": FRED_API_KEY,
+                "api_key": get_fred_key(),
                 "file_type": "json"
             }
             metadata_response = await client.get(
@@ -192,7 +197,7 @@ async def get_indicator(name: str = Query(..., description="Indicator name (e.g.
             # Get series observations
             obs_params = {
                 "series_id": series_id,
-                "api_key": FRED_API_KEY,
+                "api_key": get_fred_key(),
                 "file_type": "json",
                 "sort_order": "desc",
                 "limit": 10
@@ -254,7 +259,7 @@ async def search_series(query: str = Query(..., description="Search query (e.g.,
             # Search FRED series
             search_params = {
                 "search_text": query,
-                "api_key": FRED_API_KEY,
+                "api_key": get_fred_key(),
                 "file_type": "json",
                 "limit": 10
             }
