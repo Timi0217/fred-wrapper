@@ -239,7 +239,8 @@ fetchSeries(seriesId);
 });
 });
 fetchHealth();
-indicators.forEach(ind=>fetchIndicator(ind));
+async function loadIndicators(){for(const ind of indicators){await fetchIndicator(ind);await new Promise(r=>setTimeout(r,300))}}
+loadIndicators();
 </script>
 </body>
 </html>"""
