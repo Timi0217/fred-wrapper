@@ -62,7 +62,7 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#0a0a0a;color:#ff
 @keyframes fadeIn{to{opacity:1}}
 .card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:24px;margin-bottom:20px}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.title{font-family:'Courier New',monospace;font-style:italic;font-size:28px;color:#5B8DB8;font-weight:600}
+.title{font-family:'Courier New',monospace;font-size:28px;color:#5B8DB8;font-weight:700}
 .health{display:flex;align-items:center;gap:6px;font-size:13px;color:#888}
 .health-dot{width:8px;height:8px;background:#0f0;border-radius:50%;animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
