@@ -149,59 +149,50 @@ button:hover{background:#4A7CA6;transform:translateY(-1px)}
 </div>
 </div>
 <script>
-const indicators=[
-{name:'fed_funds_rate',idx:0,label:'FED FUNDS RATE'},
-{name:'cpi',idx:1,label:'CPI (YEAR OVER YEAR)'},
-{name:'unemployment',idx:2,label:'UNEMPLOYMENT RATE'},
-{name:'gdp',idx:3,label:'REAL GDP GROWTH'}
-];
-async function fetchHealth(){
+async function init(){
 const start=Date.now();
 try{
 const res=await fetch('/health');
-const data=await res.json();
 const ms=Date.now()-start;
 document.getElementById('health-text').textContent='online \u00b7 '+ms+'ms';
 }catch(e){
 document.getElementById('health-text').textContent='offline';
 document.querySelector('.health-dot').style.background='#f55';
 }
-}
-async function fetchIndicator(ind){
+// All indicator data in one server-side call
 try{
-const res=await fetch('/indicator?name='+ind.name);
-const data=await res.json();
-const card=document.querySelectorAll('.indicator-card')[ind.idx];
+const dash=await fetch('/dashboard').then(r=>r.json());
+const inds=dash.indicators||[];
+const cards=document.querySelectorAll('.indicator-card');
+const monthNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+inds.forEach((ind,i)=>{
+if(i>=cards.length)return;
+const card=cards[i];
 const valueEl=card.querySelector('.indicator-value');
 const periodEl=card.querySelector('.indicator-period');
-if(data.observations && data.observations.length>0){
-const latest=data.observations[0];
-const val=parseFloat(latest.value);
-const date=new Date(latest.date);
-const monthNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-const month=monthNames[date.getMonth()];
-const year=date.getFullYear();
-let period=month+' '+year;
-if(data.frequency==='Quarterly'){
-const q=Math.floor(date.getMonth()/3)+1;
-period='Q'+q+' '+year;
-}
+if(ind.value){
+const val=parseFloat(ind.value);
 valueEl.innerHTML=val.toFixed(1)+'<sub>%</sub>';
 valueEl.classList.remove('loading');
-periodEl.textContent=period;
+if(ind.date){
+const date=new Date(ind.date);
+const month=monthNames[date.getMonth()];
+const year=date.getFullYear();
+const q=Math.floor(date.getMonth()/3)+1;
+periodEl.textContent=ind.name==='gdp'?'Q'+q+' '+year:month+' '+year;
+}
 }else{
 valueEl.innerHTML='--<sub>%</sub>';
 valueEl.classList.remove('loading');
 periodEl.textContent='No data';
 }
+});
 }catch(e){
-const card=document.querySelectorAll('.indicator-card')[ind.idx];
-const valueEl=card.querySelector('.indicator-value');
-const periodEl=card.querySelector('.indicator-period');
-valueEl.innerHTML='--<sub>%</sub>';
-valueEl.classList.remove('loading');
-valueEl.classList.add('error');
-periodEl.textContent='Error';
+document.querySelectorAll('.indicator-card').forEach(card=>{
+card.querySelector('.indicator-value').innerHTML='--<sub>%</sub>';
+card.querySelector('.indicator-value').classList.remove('loading');
+card.querySelector('.indicator-period').textContent='Error';
+});
 }
 }
 async function fetchSeries(seriesId){
@@ -238,9 +229,7 @@ document.getElementById('seriesInput').value=seriesId;
 fetchSeries(seriesId);
 });
 });
-fetchHealth();
-async function loadIndicators(){for(const ind of indicators){await fetchIndicator(ind);await new Promise(r=>setTimeout(r,300))}}
-loadIndicators();
+init();
 </script>
 </body>
 </html>"""
@@ -258,6 +247,62 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """
+    Single endpoint for homepage data: fetches all 4 indicator values sequentially
+    with delays to respect FRED rate limits. Returns everything in one response.
+    """
+    import asyncio
+
+    indicators = [
+        {"name": "fed_funds_rate", "series_id": "FEDFUNDS", "label": "FED FUNDS RATE"},
+        {"name": "cpi", "series_id": "CPIAUCSL", "label": "CPI (YEAR OVER YEAR)"},
+        {"name": "unemployment", "series_id": "UNRATE", "label": "UNEMPLOYMENT RATE"},
+        {"name": "gdp", "series_id": "GDP", "label": "REAL GDP GROWTH"},
+    ]
+
+    results = []
+    key = get_fred_key()
+
+    async with httpx.AsyncClient() as client:
+        for i, ind in enumerate(indicators):
+            entry = {"name": ind["name"], "label": ind["label"], "value": None, "date": None, "frequency": None}
+            try:
+                # Only need observations, skip metadata to halve API calls
+                obs_params = {
+                    "series_id": ind["series_id"],
+                    "api_key": key,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": 1,
+                }
+                resp = await client.get(
+                    f"{FRED_BASE_URL}/series/observations",
+                    params=obs_params,
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    obs_data = resp.json()
+                    obs_list = obs_data.get("observations", [])
+                    if obs_list:
+                        entry["value"] = obs_list[0].get("value")
+                        entry["date"] = obs_list[0].get("date")
+            except Exception:
+                pass
+
+            results.append(entry)
+
+            # Small delay between calls to avoid rate limiting
+            if i < len(indicators) - 1:
+                await asyncio.sleep(0.5)
+
+    return {
+        "indicators": results,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 
 
