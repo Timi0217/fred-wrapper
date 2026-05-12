@@ -242,7 +242,7 @@ HOME_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FRED \u2014 Federal Reserve Economic Data</title>
+<title>FRED &mdash; Federal Reserve Economic Data</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#0a0a0a;color:#e8e8e8;padding:40px 20px;line-height:1.5}
@@ -333,7 +333,7 @@ body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background
 <div class="card" style="animation-delay:.25s">
 <div class="search-row">
 <input type="text" class="search-input" id="searchInput" placeholder="Enter series ID (e.g. GDP, CPIAUCSL)" required>
-<button class="search-btn" onclick="doSearch()">Fetch \u2192</button>
+<button class="search-btn" onclick="doSearch()">Fetch &rarr;</button>
 </div>
 <div class="quick-links">
 <span style="color:#444;font-size:11px;margin-right:2px">Try:</span>
