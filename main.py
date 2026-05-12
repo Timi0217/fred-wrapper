@@ -1,14 +1,33 @@
 import os
-from datetime import datetime
+import time
+import asyncio
+from datetime import datetime, timezone
 from typing import Optional
+from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, HTMLResponse
 
-app = FastAPI(title="FRED API Wrapper", version="1.0.0")
 
 # Check for API key at startup
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+http_client: Optional[httpx.AsyncClient] = None
+
+# ── Dashboard cache ──────────────────────────────────────────────────────
+_dashboard_data: dict = {"indicators": [], "status": "warming_up"}
+_cache: dict[str, tuple[float, dict]] = {}
+CACHE_TTL = 3600  # 1 hour
+
+
+def _cache_get(key: str):
+    entry = _cache.get(key)
+    if entry and time.time() - entry[0] < CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _cache_set(key: str, value: dict):
+    _cache[key] = (time.time(), value)
 
 FRED_BASE_URL = "https://api.stlouisfed.org/fred"
 
@@ -18,6 +37,175 @@ def get_fred_key() -> str:
     if not key:
         raise HTTPException(status_code=503, detail="FRED_API_KEY not configured")
     return key
+
+
+async def _bg_fetch_obs(series_id: str, limit: int = 1) -> list:
+    """Fetch observations for a series in background task."""
+    key = FRED_API_KEY or os.environ.get("FRED_API_KEY", "")
+    if not key:
+        return []
+    try:
+        resp = await http_client.get(
+            f"{FRED_BASE_URL}/series/observations",
+            params={
+                "series_id": series_id,
+                "api_key": key,
+                "file_type": "json",
+                "sort_order": "desc",
+                "limit": limit,
+            },
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("observations", [])
+    except Exception:
+        pass
+    return []
+
+
+async def _refresh_dashboard():
+    """Background task: computes dashboard values on startup, then every 2 hours."""
+    global _dashboard_data
+    await asyncio.sleep(3)
+
+    while True:
+        prev = _dashboard_data.get("indicators", [])
+        prev_map = {ind["name"]: ind for ind in prev if isinstance(ind, dict)}
+        results = []
+
+        # 1) Fed Funds Rate — FEDFUNDS — already a percentage
+        entry = prev_map.get("fed_funds_rate", {})
+        obs = await _bg_fetch_obs("FEDFUNDS", 1)
+        if obs and obs[0].get("value", ".") != ".":
+            val = float(obs[0]["value"])
+            entry = {
+                "name": "fed_funds_rate",
+                "label": "FED FUNDS RATE",
+                "value": round(val, 2),
+                "unit": "%",
+                "date": obs[0].get("date"),
+                "direction": None,
+            }
+        results.append(entry if entry else {"name": "fed_funds_rate", "label": "FED FUNDS RATE", "value": None})
+
+        await asyncio.sleep(1)
+
+        # 2) CPI Year-over-Year — compute from CPIAUCSL (need 13 months)
+        entry = prev_map.get("cpi_yoy", {})
+        obs = await _bg_fetch_obs("CPIAUCSL", 13)
+        if len(obs) >= 13:
+            try:
+                current = float(obs[0]["value"])
+                year_ago = float(obs[12]["value"])
+                yoy = ((current - year_ago) / year_ago) * 100
+                entry = {
+                    "name": "cpi_yoy",
+                    "label": "CPI INFLATION",
+                    "value": round(yoy, 1),
+                    "unit": "% YoY",
+                    "date": obs[0].get("date"),
+                    "direction": "up" if yoy > 2.0 else "down" if yoy < 1.0 else "neutral",
+                }
+            except (ValueError, ZeroDivisionError):
+                pass
+        results.append(entry if entry else {"name": "cpi_yoy", "label": "CPI INFLATION", "value": None})
+
+        await asyncio.sleep(1)
+
+        # 3) Unemployment Rate — UNRATE — already a percentage
+        entry = prev_map.get("unemployment", {})
+        obs = await _bg_fetch_obs("UNRATE", 2)
+        if obs and obs[0].get("value", ".") != ".":
+            val = float(obs[0]["value"])
+            prev_val = float(obs[1]["value"]) if len(obs) > 1 and obs[1].get("value", ".") != "." else None
+            entry = {
+                "name": "unemployment",
+                "label": "UNEMPLOYMENT",
+                "value": round(val, 1),
+                "unit": "%",
+                "date": obs[0].get("date"),
+                "direction": ("up" if prev_val and val > prev_val else "down" if prev_val and val < prev_val else "neutral") if prev_val else None,
+                "previous": round(prev_val, 1) if prev_val else None,
+            }
+        results.append(entry if entry else {"name": "unemployment", "label": "UNEMPLOYMENT", "value": None})
+
+        await asyncio.sleep(1)
+
+        # 4) Real GDP Growth — A191RL1Q225SBEA — already a percentage (annualized quarterly)
+        entry = prev_map.get("gdp_growth", {})
+        obs = await _bg_fetch_obs("A191RL1Q225SBEA", 2)
+        if obs and obs[0].get("value", ".") != ".":
+            val = float(obs[0]["value"])
+            prev_val = float(obs[1]["value"]) if len(obs) > 1 and obs[1].get("value", ".") != "." else None
+            entry = {
+                "name": "gdp_growth",
+                "label": "GDP GROWTH",
+                "value": round(val, 1),
+                "unit": "% QoQ",
+                "date": obs[0].get("date"),
+                "direction": ("up" if prev_val and val > prev_val else "down" if prev_val and val < prev_val else "neutral") if prev_val else None,
+                "previous": round(prev_val, 1) if prev_val else None,
+            }
+        results.append(entry if entry else {"name": "gdp_growth", "label": "GDP GROWTH", "value": None})
+
+        await asyncio.sleep(1)
+
+        # 5) 10-Year Treasury — DGS10
+        entry = prev_map.get("treasury_10y", {})
+        obs = await _bg_fetch_obs("DGS10", 5)
+        valid = [o for o in obs if o.get("value", ".") != "."]
+        if valid:
+            val = float(valid[0]["value"])
+            prev_val = float(valid[1]["value"]) if len(valid) > 1 else None
+            entry = {
+                "name": "treasury_10y",
+                "label": "10Y TREASURY",
+                "value": round(val, 2),
+                "unit": "%",
+                "date": valid[0].get("date"),
+                "direction": ("up" if prev_val and val > prev_val else "down" if prev_val and val < prev_val else "neutral") if prev_val else None,
+            }
+        results.append(entry if entry else {"name": "treasury_10y", "label": "10Y TREASURY", "value": None})
+
+        await asyncio.sleep(1)
+
+        # 6) 30Y Mortgage Rate — MORTGAGE30US
+        entry = prev_map.get("mortgage_30y", {})
+        obs = await _bg_fetch_obs("MORTGAGE30US", 5)
+        valid = [o for o in obs if o.get("value", ".") != "."]
+        if valid:
+            val = float(valid[0]["value"])
+            prev_val = float(valid[1]["value"]) if len(valid) > 1 else None
+            entry = {
+                "name": "mortgage_30y",
+                "label": "30Y MORTGAGE",
+                "value": round(val, 2),
+                "unit": "%",
+                "date": valid[0].get("date"),
+                "direction": ("up" if prev_val and val > prev_val else "down" if prev_val and val < prev_val else "neutral") if prev_val else None,
+            }
+        results.append(entry if entry else {"name": "mortgage_30y", "label": "30Y MORTGAGE", "value": None})
+
+        _dashboard_data["indicators"] = results
+        _dashboard_data["status"] = "ready"
+        _dashboard_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        _cache_set("dashboard", _dashboard_data)
+
+        await asyncio.sleep(7200)  # Refresh every 2 hours
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(timeout=15.0)
+    task = asyncio.create_task(_refresh_dashboard())
+    yield
+    task.cancel()
+    await http_client.aclose()
+
+
+app = FastAPI(title="FRED API Wrapper", version="1.0.0", lifespan=lifespan)
 
 # Indicator name to FRED series ID mapping
 INDICATOR_MAPPING = {
@@ -57,178 +245,210 @@ HOME_HTML = """<!DOCTYPE html>
 <title>FRED \u2014 Federal Reserve Economic Data</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;background:#0a0a0a;color:#fff;padding:40px 20px;line-height:1.5}
-.container{max-width:640px;margin:0 auto;opacity:0;animation:fadeIn .6s ease forwards}
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:#0a0a0a;color:#e8e8e8;padding:40px 20px;line-height:1.5}
+.container{max-width:680px;margin:0 auto;opacity:0;animation:fadeIn .5s ease forwards}
 @keyframes fadeIn{to{opacity:1}}
-.card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:24px;margin-bottom:20px}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.title{font-family:'Courier New',monospace;font-size:28px;color:#5B8DB8;font-weight:700}
-.health{display:flex;align-items:center;gap:6px;font-size:13px;color:#888}
-.health-dot{width:8px;height:8px;background:#0f0;border-radius:50%;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
-.subtitle{color:#888;font-size:15px;margin-bottom:24px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
-.indicator-card{background:rgba(10,10,10,.5);border-radius:12px;padding:16px;border-left:3px solid;position:relative;animation:slideUp .6s ease backwards}
-@keyframes slideUp{from{opacity:0;transform:translateY(10px)}}
-.indicator-card:nth-child(1){border-left-color:#5B8DB8;animation-delay:.1s}
-.indicator-card:nth-child(2){border-left-color:#4A7CA6;animation-delay:.2s}
-.indicator-card:nth-child(3){border-left-color:#6B9DC8;animation-delay:.3s}
-.indicator-card:nth-child(4){border-left-color:#3A6B96;animation-delay:.4s}
-.indicator-label{font-size:11px;color:#999;text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:8px}
-.indicator-value{font-family:'Courier New',monospace;font-size:44px;color:#fff;font-weight:700;line-height:1}
-.indicator-value sub{font-size:20px;color:#ccc;font-weight:400}
-.indicator-period{font-size:13px;color:#666;margin-top:6px}
-.series-list{list-style:none}
-.series-item{padding:12px 0;border-bottom:1px solid rgba(255,255,255,.05);display:flex;justify-content:space-between;align-items:center;font-size:14px}
-.series-item:last-child{border-bottom:none}
-.series-id{font-family:'Courier New',monospace;color:#5B8DB8;font-weight:600}
-.series-meta{color:#666;font-size:13px}
-.section-title{font-size:12px;color:#999;text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:16px}
-.form-group{display:flex;gap:8px;margin-bottom:12px}
-input{flex:1;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:12px 16px;color:#fff;font-size:14px;outline:none;transition:.2s}
-input:focus{border-color:#5B8DB8;background:rgba(255,255,255,.08)}
-input::placeholder{color:#666}
-button{background:#5B8DB8;color:#fff;border:none;border-radius:8px;padding:12px 24px;font-size:14px;font-weight:600;cursor:pointer;transition:.2s}
-button:hover{background:#4A7CA6;transform:translateY(-1px)}
-.try-links{font-size:13px;color:#666}
-.try-links a{color:#5B8DB8;text-decoration:none;margin:0 2px}
-.try-links a:hover{text-decoration:underline}
-#result{margin-top:16px;padding:16px;background:rgba(91,141,184,.1);border:1px solid rgba(91,141,184,.3);border-radius:8px;font-family:'Courier New',monospace;font-size:13px;color:#aaa;white-space:pre-wrap;word-wrap:break-word;display:none}
-.loading{color:#5B8DB8}
-.error{color:#f55}
+@keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+
+/* Header */
+.header-card{background:linear-gradient(135deg,rgba(30,58,82,.4),rgba(20,40,60,.2));border:1px solid rgba(91,141,184,.15);border-radius:20px;padding:28px 28px 0;margin-bottom:16px;overflow:hidden}
+.header-row{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px}
+.brand{display:flex;align-items:center;gap:12px}
+.brand-icon{width:42px;height:42px;background:linear-gradient(135deg,#5B8DB8,#3A6B96);border-radius:10px;display:flex;align-items:center;justify-content:center;font-family:'Courier New',monospace;font-weight:900;font-size:16px;color:#fff;letter-spacing:-1px}
+.brand-text .title{font-size:22px;font-weight:700;color:#fff;letter-spacing:-.5px}
+.brand-text .org{font-size:12px;color:rgba(91,141,184,.8);font-weight:500;letter-spacing:.5px}
+.health-badge{display:flex;align-items:center;gap:6px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:6px 14px;font-size:12px;color:#888;backdrop-filter:blur(10px)}
+.health-dot{width:7px;height:7px;background:#555;border-radius:50%;transition:background .3s}
+.health-dot.on{background:#4CAF50;box-shadow:0 0 8px rgba(76,175,80,.4)}
+.tagline{color:#888;font-size:14px;margin-bottom:20px;margin-left:54px}
+
+/* Indicator grid */
+.grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;background:rgba(255,255,255,.04);border-radius:0 0 20px 20px;overflow:hidden;margin:0 -28px}
+.ind{background:#0a0a0a;padding:20px;text-align:center;position:relative;transition:background .2s}
+.ind:hover{background:rgba(91,141,184,.04)}
+.ind-label{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:1.2px;font-weight:600;margin-bottom:10px}
+.ind-val{font-family:'Courier New',monospace;font-size:28px;font-weight:700;color:#fff;line-height:1;margin-bottom:2px}
+.ind-unit{font-size:13px;color:#555;font-weight:400}
+.ind-meta{font-size:11px;color:#555;margin-top:8px;display:flex;align-items:center;justify-content:center;gap:4px}
+.arrow{font-size:10px;display:inline-block}
+.arrow.up{color:#4CAF50}
+.arrow.down{color:#ef5350}
+.ind.warm .ind-val{color:#555;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:.6}50%{opacity:.3}}
+
+/* Secondary cards */
+.card{background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.06);border-radius:16px;padding:20px 24px;margin-bottom:12px;animation:slideUp .5s ease backwards}
+
+/* Series list */
+.series-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.series-chip{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:10px;cursor:pointer;transition:all .2s}
+.series-chip:hover{background:rgba(91,141,184,.08);border-color:rgba(91,141,184,.2)}
+.series-chip .id{font-family:'Courier New',monospace;font-size:13px;color:#5B8DB8;font-weight:600}
+.series-chip .freq{font-size:11px;color:#555}
+
+/* Search */
+.search-row{display:flex;gap:8px;margin-bottom:10px}
+.search-input{flex:1;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:11px 16px;color:#fff;font-size:14px;outline:none;transition:all .2s}
+.search-input:focus{border-color:rgba(91,141,184,.5);background:rgba(255,255,255,.06);box-shadow:0 0 0 3px rgba(91,141,184,.1)}
+.search-input::placeholder{color:#444}
+.search-btn{background:linear-gradient(135deg,#5B8DB8,#4A7CA6);color:#fff;border:none;border-radius:10px;padding:11px 20px;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;white-space:nowrap}
+.search-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(91,141,184,.3)}
+.quick-links{display:flex;gap:6px;flex-wrap:wrap}
+.quick-link{background:rgba(255,255,255,.04);color:#666;padding:5px 10px;border-radius:6px;font-size:11px;cursor:pointer;transition:all .15s;border:1px solid transparent;font-family:'Courier New',monospace}
+.quick-link:hover{background:rgba(91,141,184,.1);color:#5B8DB8;border-color:rgba(91,141,184,.2)}
+#result{margin-top:14px;padding:14px;background:rgba(91,141,184,.06);border:1px solid rgba(91,141,184,.15);border-radius:10px;font-family:'Courier New',monospace;font-size:12px;color:#999;white-space:pre-wrap;word-wrap:break-word;display:none;max-height:300px;overflow-y:auto}
+.section-label{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:1.5px;font-weight:600;margin-bottom:12px}
 </style>
 </head>
 <body>
 <div class="container">
-<div class="card">
-<div class="header">
-<h1 class="title">FRED</h1>
-<div class="health"><span class="health-dot"></span><span id="health-text">checking...</span></div>
-</div>
-<p class="subtitle">Federal Reserve Economic Data \u2014 GDP, CPI, unemployment, rates</p>
-<div class="grid" id="indicators">
-<div class="indicator-card">
-<div class="indicator-label">Fed Funds Rate</div>
-<div class="indicator-value loading">--<sub>%</sub></div>
-<div class="indicator-period">Loading...</div>
-</div>
-<div class="indicator-card">
-<div class="indicator-label">CPI (Year over Year)</div>
-<div class="indicator-value loading">--<sub>%</sub></div>
-<div class="indicator-period">Loading...</div>
-</div>
-<div class="indicator-card">
-<div class="indicator-label">Unemployment Rate</div>
-<div class="indicator-value loading">--<sub>%</sub></div>
-<div class="indicator-period">Loading...</div>
-</div>
-<div class="indicator-card">
-<div class="indicator-label">Real GDP Growth</div>
-<div class="indicator-value loading">--<sub>%</sub></div>
-<div class="indicator-period">Loading...</div>
+
+<div class="header-card">
+<div class="header-row">
+<div class="brand">
+<div class="brand-icon">F</div>
+<div class="brand-text">
+<div class="title">FRED</div>
+<div class="org">Federal Reserve Economic Data</div>
 </div>
 </div>
+<div class="health-badge"><span class="health-dot" id="dot"></span><span id="health-text">checking...</span></div>
 </div>
-<div class="card" style="animation:slideUp .6s .5s ease backwards">
-<div class="section-title">Popular Series</div>
-<ul class="series-list">
-<li class="series-item"><span class="series-id">FEDFUNDS</span><span class="series-meta">Monthly \u00b7 since 1954</span></li>
-<li class="series-item"><span class="series-id">CPIAUCSL</span><span class="series-meta">Monthly \u00b7 since 1947</span></li>
-<li class="series-item"><span class="series-id">UNRATE</span><span class="series-meta">Monthly \u00b7 since 1948</span></li>
-<li class="series-item"><span class="series-id">GDP</span><span class="series-meta">Quarterly \u00b7 since 1947</span></li>
-<li class="series-item"><span class="series-id">DGS10</span><span class="series-meta">Daily \u00b7 since 1962</span></li>
-</ul>
+<div class="tagline">Macro indicators, interest rates, inflation &amp; employment</div>
+<div class="grid" id="grid"></div>
 </div>
-<div class="card" style="animation:slideUp .6s .6s ease backwards">
-<form id="seriesForm" class="form-group">
-<input type="text" id="seriesInput" placeholder="GDP" required>
-<button type="submit">\u2192 series</button>
-</form>
-<div class="try-links">Try: <a href="#" data-series="FEDFUNDS">FEDFUNDS</a> \u00b7 <a href="#" data-series="CPIAUCSL">CPIAUCSL</a> \u00b7 <a href="#" data-series="UNRATE">UNRATE</a> \u00b7 <a href="#" data-series="DGS10">DGS10</a></div>
+
+<div class="card" style="animation-delay:.15s">
+<div class="section-label">Popular Series</div>
+<div class="series-grid" id="seriesGrid">
+<div class="series-chip" onclick="doSearch('FEDFUNDS')"><span class="id">FEDFUNDS</span><span class="freq">Monthly</span></div>
+<div class="series-chip" onclick="doSearch('CPIAUCSL')"><span class="id">CPIAUCSL</span><span class="freq">Monthly</span></div>
+<div class="series-chip" onclick="doSearch('UNRATE')"><span class="id">UNRATE</span><span class="freq">Monthly</span></div>
+<div class="series-chip" onclick="doSearch('DGS10')"><span class="id">DGS10</span><span class="freq">Daily</span></div>
+<div class="series-chip" onclick="doSearch('GDP')"><span class="id">GDP</span><span class="freq">Quarterly</span></div>
+<div class="series-chip" onclick="doSearch('MORTGAGE30US')"><span class="id">MORTGAGE30US</span><span class="freq">Weekly</span></div>
+</div>
+</div>
+
+<div class="card" style="animation-delay:.25s">
+<div class="search-row">
+<input type="text" class="search-input" id="searchInput" placeholder="Enter series ID (e.g. GDP, CPIAUCSL)" required>
+<button class="search-btn" onclick="doSearch()">Fetch \u2192</button>
+</div>
+<div class="quick-links">
+<span style="color:#444;font-size:11px;margin-right:2px">Try:</span>
+<span class="quick-link" onclick="doSearch('FEDFUNDS')">FEDFUNDS</span>
+<span class="quick-link" onclick="doSearch('SP500')">SP500</span>
+<span class="quick-link" onclick="doSearch('DCOILWTICO')">OIL</span>
+<span class="quick-link" onclick="doSearch('ICSA')">JOBLESS</span>
+<span class="quick-link" onclick="doSearch('M2SL')">M2</span>
+</div>
 <div id="result"></div>
 </div>
+
 </div>
+
 <script>
-async function init(){
-const start=Date.now();
-try{
-const res=await fetch('/health');
-const ms=Date.now()-start;
-document.getElementById('health-text').textContent='online \u00b7 '+ms+'ms';
-}catch(e){
-document.getElementById('health-text').textContent='offline';
-document.querySelector('.health-dot').style.background='#f55';
+const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function renderGrid(inds, warming) {
+  const g = document.getElementById('grid');
+  if (!inds || !inds.length) {
+    g.innerHTML = Array(6).fill('<div class="ind warm"><div class="ind-label">\\u2014</div><div class="ind-val">\\u2014</div><div class="ind-meta">Loading...</div></div>').join('');
+    return;
+  }
+  g.innerHTML = inds.map(function(ind) {
+    if (!ind.value && ind.value !== 0) {
+      return '<div class="ind' + (warming ? ' warm' : '') + '"><div class="ind-label">' + (ind.label || '\\u2014') + '</div><div class="ind-val">\\u2014</div><div class="ind-meta">' + (warming ? 'Loading...' : 'No data') + '</div></div>';
+    }
+    var val = typeof ind.value === 'number' ? ind.value : parseFloat(ind.value);
+    var display = Math.abs(val) >= 10 ? val.toFixed(1) : val.toFixed(2);
+    var unit = ind.unit || '%';
+    var arrow = '';
+    if (ind.direction === 'up') arrow = '<span class="arrow up">\\u25B2</span>';
+    else if (ind.direction === 'down') arrow = '<span class="arrow down">\\u25BC</span>';
+    var period = '';
+    if (ind.date) {
+      var d = new Date(ind.date + 'T00:00:00');
+      var m = M[d.getMonth()];
+      var y = d.getFullYear();
+      if (ind.name === 'gdp_growth') {
+        var q = Math.floor(d.getMonth() / 3) + 1;
+        period = 'Q' + q + ' ' + y;
+      } else {
+        period = m + ' ' + y;
+      }
+    }
+    var prev = '';
+    if (ind.previous != null && ind.direction) {
+      prev = ' \\u00b7 prev ' + ind.previous;
+    }
+    return '<div class="ind"><div class="ind-label">' + ind.label + '</div><div class="ind-val">' + display + '<span class="ind-unit"> ' + unit + '</span></div><div class="ind-meta">' + arrow + period + prev + '</div></div>';
+  }).join('');
 }
-// All indicator data in one server-side call
-try{
-const dash=await fetch('/dashboard').then(r=>r.json());
-const inds=dash.indicators||[];
-const cards=document.querySelectorAll('.indicator-card');
-const monthNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-inds.forEach((ind,i)=>{
-if(i>=cards.length)return;
-const card=cards[i];
-const valueEl=card.querySelector('.indicator-value');
-const periodEl=card.querySelector('.indicator-period');
-if(ind.value){
-const val=parseFloat(ind.value);
-valueEl.innerHTML=val.toFixed(1)+'<sub>%</sub>';
-valueEl.classList.remove('loading');
-if(ind.date){
-const date=new Date(ind.date);
-const month=monthNames[date.getMonth()];
-const year=date.getFullYear();
-const q=Math.floor(date.getMonth()/3)+1;
-periodEl.textContent=ind.name==='gdp'?'Q'+q+' '+year:month+' '+year;
+
+async function init() {
+  // Health check
+  var t0 = Date.now();
+  try {
+    await fetch('/health');
+    var ms = Date.now() - t0;
+    document.getElementById('dot').classList.add('on');
+    document.getElementById('health-text').textContent = 'online \\u00b7 ' + ms + 'ms';
+  } catch(e) {
+    document.getElementById('health-text').textContent = 'offline';
+  }
+
+  // Dashboard data
+  try {
+    var dash = await fetch('/dashboard').then(function(r) { return r.json(); });
+    var warming = dash.status === 'warming_up';
+    renderGrid(dash.indicators || [], warming);
+    if (warming) {
+      var poll = setInterval(async function() {
+        try {
+          var d2 = await fetch('/dashboard').then(function(r) { return r.json(); });
+          renderGrid(d2.indicators || [], d2.status === 'warming_up');
+          if (d2.status === 'ready') clearInterval(poll);
+        } catch(e) { clearInterval(poll); }
+      }, 8000);
+    }
+  } catch(e) {
+    renderGrid([], false);
+  }
 }
-}else{
-valueEl.innerHTML='--<sub>%</sub>';
-valueEl.classList.remove('loading');
-periodEl.textContent='No data';
+
+async function doSearch(seriesId) {
+  if (!seriesId) {
+    seriesId = document.getElementById('searchInput').value.trim().toUpperCase();
+  }
+  if (!seriesId) return;
+  document.getElementById('searchInput').value = seriesId;
+  var resultDiv = document.getElementById('result');
+  resultDiv.style.display = 'block';
+  resultDiv.style.color = '#5B8DB8';
+  resultDiv.textContent = 'Loading ' + seriesId + '...';
+  try {
+    var res = await fetch('/series?series_id=' + encodeURIComponent(seriesId));
+    if (!res.ok) {
+      var err = await res.json();
+      resultDiv.style.color = '#ef5350';
+      resultDiv.textContent = 'Error: ' + (err.detail || 'Unknown error');
+      return;
+    }
+    var data = await res.json();
+    resultDiv.style.color = '#999';
+    resultDiv.textContent = JSON.stringify(data, null, 2);
+  } catch(e) {
+    resultDiv.style.color = '#ef5350';
+    resultDiv.textContent = 'Error: ' + e.message;
+  }
 }
+
+document.getElementById('searchInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') { e.preventDefault(); doSearch(); }
 });
-}catch(e){
-document.querySelectorAll('.indicator-card').forEach(card=>{
-card.querySelector('.indicator-value').innerHTML='--<sub>%</sub>';
-card.querySelector('.indicator-value').classList.remove('loading');
-card.querySelector('.indicator-period').textContent='Error';
-});
-}
-}
-async function fetchSeries(seriesId){
-const resultDiv=document.getElementById('result');
-resultDiv.style.display='block';
-resultDiv.textContent='Loading...';
-resultDiv.className='loading';
-try{
-const res=await fetch('/series?series_id='+encodeURIComponent(seriesId));
-if(!res.ok){
-const err=await res.json();
-resultDiv.textContent='Error: '+(err.detail||'Unknown error');
-resultDiv.className='error';
-return;
-}
-const data=await res.json();
-resultDiv.textContent=JSON.stringify(data,null,2);
-resultDiv.className='';
-}catch(e){
-resultDiv.textContent='Error: '+e.message;
-resultDiv.className='error';
-}
-}
-document.getElementById('seriesForm').addEventListener('submit',function(e){
-e.preventDefault();
-const seriesId=document.getElementById('seriesInput').value.trim();
-if(seriesId)fetchSeries(seriesId);
-});
-document.querySelectorAll('.try-links a').forEach(link=>{
-link.addEventListener('click',function(e){
-e.preventDefault();
-const seriesId=this.getAttribute('data-series');
-document.getElementById('seriesInput').value=seriesId;
-fetchSeries(seriesId);
-});
-});
+
 init();
 </script>
 </body>
@@ -252,58 +472,9 @@ async def health_check():
 
 @app.get("/dashboard")
 async def dashboard():
-    """
-    Single endpoint for homepage data: fetches all 4 indicator values sequentially
-    with delays to respect FRED rate limits. Returns everything in one response.
-    """
-    import asyncio
-
-    indicators = [
-        {"name": "fed_funds_rate", "series_id": "FEDFUNDS", "label": "FED FUNDS RATE"},
-        {"name": "cpi", "series_id": "CPIAUCSL", "label": "CPI (YEAR OVER YEAR)"},
-        {"name": "unemployment", "series_id": "UNRATE", "label": "UNEMPLOYMENT RATE"},
-        {"name": "gdp", "series_id": "GDP", "label": "REAL GDP GROWTH"},
-    ]
-
-    results = []
-    key = get_fred_key()
-
-    async with httpx.AsyncClient() as client:
-        for i, ind in enumerate(indicators):
-            entry = {"name": ind["name"], "label": ind["label"], "value": None, "date": None, "frequency": None}
-            try:
-                # Only need observations, skip metadata to halve API calls
-                obs_params = {
-                    "series_id": ind["series_id"],
-                    "api_key": key,
-                    "file_type": "json",
-                    "sort_order": "desc",
-                    "limit": 1,
-                }
-                resp = await client.get(
-                    f"{FRED_BASE_URL}/series/observations",
-                    params=obs_params,
-                    timeout=10.0,
-                )
-                if resp.status_code == 200:
-                    obs_data = resp.json()
-                    obs_list = obs_data.get("observations", [])
-                    if obs_list:
-                        entry["value"] = obs_list[0].get("value")
-                        entry["date"] = obs_list[0].get("date")
-            except Exception:
-                pass
-
-            results.append(entry)
-
-            # Small delay between calls to avoid rate limiting
-            if i < len(indicators) - 1:
-                await asyncio.sleep(0.5)
-
-    return {
-        "indicators": results,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
+    """Returns pre-fetched dashboard data instantly. Data is refreshed every 2 hours
+    by a background task — no blocking upstream calls on this endpoint."""
+    return _dashboard_data
 
 
 @app.get("/series")
