@@ -354,19 +354,19 @@ const M=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'
 function renderGrid(inds, warming) {
   const g = document.getElementById('grid');
   if (!inds || !inds.length) {
-    g.innerHTML = Array(6).fill('<div class="ind warm"><div class="ind-label">\\u2014</div><div class="ind-val">\\u2014</div><div class="ind-meta">Loading...</div></div>').join('');
+    g.innerHTML = Array(6).fill('<div class="ind warm"><div class="ind-label">\u2014</div><div class="ind-val">\u2014</div><div class="ind-meta">Loading...</div></div>').join('');
     return;
   }
   g.innerHTML = inds.map(function(ind) {
     if (!ind.value && ind.value !== 0) {
-      return '<div class="ind' + (warming ? ' warm' : '') + '"><div class="ind-label">' + (ind.label || '\\u2014') + '</div><div class="ind-val">\\u2014</div><div class="ind-meta">' + (warming ? 'Loading...' : 'No data') + '</div></div>';
+      return '<div class="ind' + (warming ? ' warm' : '') + '"><div class="ind-label">' + (ind.label || '\u2014') + '</div><div class="ind-val">\u2014</div><div class="ind-meta">' + (warming ? 'Loading...' : 'No data') + '</div></div>';
     }
     var val = typeof ind.value === 'number' ? ind.value : parseFloat(ind.value);
     var display = Math.abs(val) >= 10 ? val.toFixed(1) : val.toFixed(2);
     var unit = ind.unit || '%';
     var arrow = '';
-    if (ind.direction === 'up') arrow = '<span class="arrow up">\\u25B2</span>';
-    else if (ind.direction === 'down') arrow = '<span class="arrow down">\\u25BC</span>';
+    if (ind.direction === 'up') arrow = '<span class="arrow up">\u25B2</span>';
+    else if (ind.direction === 'down') arrow = '<span class="arrow down">\u25BC</span>';
     var period = '';
     if (ind.date) {
       var d = new Date(ind.date + 'T00:00:00');
@@ -381,7 +381,7 @@ function renderGrid(inds, warming) {
     }
     var prev = '';
     if (ind.previous != null && ind.direction) {
-      prev = ' \\u00b7 prev ' + ind.previous;
+      prev = ' \u00b7 prev ' + ind.previous;
     }
     return '<div class="ind"><div class="ind-label">' + ind.label + '</div><div class="ind-val">' + display + '<span class="ind-unit"> ' + unit + '</span></div><div class="ind-meta">' + arrow + period + prev + '</div></div>';
   }).join('');
@@ -394,7 +394,7 @@ async function init() {
     await fetch('/health');
     var ms = Date.now() - t0;
     document.getElementById('dot').classList.add('on');
-    document.getElementById('health-text').textContent = 'online \\u00b7 ' + ms + 'ms';
+    document.getElementById('health-text').textContent = 'online \u00b7 ' + ms + 'ms';
   } catch(e) {
     document.getElementById('health-text').textContent = 'offline';
   }
